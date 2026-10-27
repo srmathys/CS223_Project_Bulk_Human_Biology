@@ -1,0 +1,28 @@
+# Gitignore file to help with development
+# Each person can have their own local data and not store on git
+# Each person can have their own .env with their Claude API key that does not get shared
+
+# Logs
+logs/
+*.log
+
+# Output directories
+data/
+output/
+analysis_input/
+analysis_results/
+
+
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+Desktop.ini
+
+# Environmental variables / Secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
