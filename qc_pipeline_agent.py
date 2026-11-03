@@ -1,0 +1,274 @@
+import contextlib
+import io
+import os
+import traceback
+from pathlib import Path
+
+import anthropic
+import anndata as ad
+import numpy as np
+import scanpy as sc
+from dotenv import load_dotenv
+
+
+# Load the API key from .env
+load_dotenv()
+
+if not os.getenv("ANTHROPIC_API_KEY"):
+    raise RuntimeError("ANTHROPIC_API_KEY was not found in the .env file.")
+
+
+# File locations
+PROJECT_DIR = Path(__file__).resolve().parent
+
+INPUT_FILE = PROJECT_DIR / "data" / "human_bone_marrow_hematopoieticd.h5ad"
+
+OUTPUT_DIR = PROJECT_DIR / "output"
+OUTPUT_FILE = OUTPUT_DIR / "processed_dataset.h5ad"
+REPORT_FILE = OUTPUT_DIR / "qc_explanation.txt"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Agent settings
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
+MAX_TOKENS = 2048
+MAX_ITERATIONS = 8
+
+client = anthropic.Anthropic()
+
+# Persistent namespace allows Claude to inspect and modify the same
+# AnnData object across multiple tool calls.
+_namespace = {
+    "__name__": "__agent__",
+    "INPUT_FILE": str(INPUT_FILE),
+    "OUTPUT_FILE": str(OUTPUT_FILE),
+    "OUTPUT_DIR": str(OUTPUT_DIR),
+    "ad": ad,
+    "sc": sc,
+    "np": np,
+}
+
+
+SYSTEM_PROMPT = """
+You are an expert bioinformatician specializing in Scanpy and scRNA-seq.
+
+Use the run_python tool to execute the analysis locally. Do not merely
+write code for the user to run later.
+
+Work in small, inspectable steps:
+
+1. Load and inspect the AnnData object.
+2. Determine whether adata.X contains raw counts, normalized values,
+   log-transformed values, or scaled values.
+3. Check whether adata.raw exists.
+4. Check whether the expression matrix is sparse.
+5. Report the detected processing state before performing QC.
+6. Do not convert a large sparse matrix to a dense NumPy array.
+7. If adata.X is already nonnegative, non-integer, and log-normalized,
+   do not call sc.pp.normalize_total() or sc.pp.log1p() again.
+8. If adata.X is scaled and adata.raw is available, use the appropriate
+   unscaled representation for downstream analysis.
+9. Reuse existing QC columns when available, including:
+   - nCount_RNA
+   - nFeature_RNA
+   - percent.mt
+   - percent.rp
+10. Calculate only missing QC metrics using sparse-compatible methods.
+11. Preserve sparse matrix storage whenever possible.
+12. Inspect the result after each major processing step.
+13. Save the final AnnData object and verify that the output file exists.
+14. Explain the detected processing state, QC decisions, filtering results,
+    and the code used at the end.
+
+The input and output paths are already available as INPUT_FILE and
+OUTPUT_FILE in the Python namespace.
+"""
+
+
+RUN_PYTHON_TOOL = {
+    "name": "run_python",
+    "description": (
+        "Execute Python code locally in a persistent namespace. "
+        "Use this to load the AnnData object, inspect it, run Scanpy "
+        "quality control and processing, and save the result."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute locally.",
+            }
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+
+def run_python(code):
+    """Execute Claude's code and return its printed output."""
+    buffer = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            exec(code, _namespace)
+
+    except BaseException:
+        buffer.write(traceback.format_exc())
+
+    return buffer.getvalue() or "(no output)"
+
+
+def claude_analysis(task):
+    """Run the persistent Claude tool-use workflow."""
+    messages = [{"role": "user", "content": task}]
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            tools=[RUN_PYTHON_TOOL],
+            messages=messages,
+        )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response.content,
+            }
+        )
+
+        if response.stop_reason == "refusal":
+            return "Claude refused to complete the task."
+
+        if response.stop_reason == "max_tokens":
+            print(f"Iteration {iteration} reached the token limit.")
+            continue
+
+        if response.stop_reason != "tool_use":
+            return "\n".join(
+                block.text
+                for block in response.content
+                if hasattr(block, "text")
+            )
+
+        tool_results = []
+
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            code = block.input.get("code", "")
+
+            print(f"\n--- Running Claude code, iteration {iteration} ---")
+            print(code)
+
+            observation = run_python(code)
+
+            print("--- Local result ---")
+            print(observation)
+
+            tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": observation,
+                }
+            )
+
+        messages.append(
+            {
+                "role": "user",
+                "content": tool_results,
+            }
+        )
+
+    return "The maximum number of Claude iterations was reached."
+
+
+TASK = f"""
+Use the run_python tool to process this scRNA-seq AnnData file locally:
+
+Input file:
+{INPUT_FILE}
+
+Save the final processed AnnData object to:
+
+{OUTPUT_FILE}
+
+Perform the following workflow:
+
+1. Load the file using scanpy.read_h5ad.
+2. Inspect:
+   - adata.X;
+   - adata.raw;
+   - adata.layers;
+   - adata.obs;
+   - adata.uns;
+   - adata.obsm.
+3. Determine whether adata.X contains raw counts,
+   normalized/log-transformed values, scaled values, or an unknown format.
+4. Report the detected processing state before filtering.
+5. Determine whether the expression matrix is sparse.
+6. Never convert the full expression matrix to a dense NumPy array.
+7. Detect mitochondrial genes using MT- or mt- prefixes.
+8. Detect ribosomal genes using RPS or RPL prefixes.
+9. Detect hemoglobin genes using HB, HBA, or HBB prefixes.
+10. Reuse existing QC columns when available:
+    nCount_RNA, nFeature_RNA, percent.mt, and percent.rp.
+11. Calculate only missing QC metrics using sparse-compatible methods.
+12. Filter cells with fewer than 100 detected genes.
+13. Filter genes detected in fewer than 3 cells only when reliable
+    count-like data are available.
+14. Filter cells with mitochondrial percentage greater than or equal
+    to 10 percent.
+15. Report the number of cells and genes before and after each filter.
+16. If adata.X is already normalized or log-transformed, do not call
+    sc.pp.normalize_total() or sc.pp.log1p() again.
+17. If raw counts are genuinely available, preserve them in
+    adata.layers["counts"].
+18. Preserve existing PCA, Harmony, and UMAP results when appropriate.
+19. Run missing dimensionality-reduction steps only when necessary.
+20. Do not run doublet detection unless the required package is already
+    installed. Optional doublet detection must not stop the workflow.
+21. Do not perform marker-gene analysis yet. Marker genes will be
+    calculated later after the scBubbleTree bubble assignments are
+    available.
+22. Create the output directory if necessary.
+23. Save the final AnnData object to exactly:
+
+    {OUTPUT_FILE}
+
+24. Verify that the output file exists and report its file size.
+
+At the end, explain:
+- the detected processing state;
+- whether the data were already normalized;
+- which QC columns were reused or calculated;
+- the filtering thresholds;
+- the number of cells and genes remaining;
+- which existing embeddings were preserved;
+- the final output path.
+
+Use sparse-compatible operations throughout.
+"""
+
+print("Starting Claude scRNA-seq QC pipeline...")
+
+final_response = claude_analysis(TASK)
+
+print("\n--- Claude's explanation ---")
+print(final_response)
+
+REPORT_FILE.write_text(final_response, encoding="utf-8")
+
+if OUTPUT_FILE.exists():
+    print(f"\nVerified output file: {OUTPUT_FILE}")
+    print(f"File size: {OUTPUT_FILE.stat().st_size} bytes")
+    print(f"Explanation saved to: {REPORT_FILE}")
+else:
+    print(f"\nWARNING: Output file was not created: {OUTPUT_FILE}")
